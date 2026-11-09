@@ -7698,8 +7698,9 @@ enum { PSO_ARCH_COMPACT = 8 };
 static int g_compact_enabled;   // immutable after pso4_init; unlike g_compact_files, never cleared by the archive queue
 static NSArray<NSString *> *g_compact_files; static _Atomic int g_compacted;
 // g_compact_periods: periods that may hold recaptured bases, handed over and not written yet; g_compact_closed: the last of them is handed over (the first flush after the prewarm);
-// g_compact_bad: one was not written, or a base the prewarm took from an old file was not captured again: the old files stay (arch_compact_finish)
-static _Atomic int g_compact_periods, g_compact_closed, g_compact_bad;
+// g_compact_bad: one was not written, or a base the prewarm took from an old file was not captured again: the old files stay (arch_compact_finish); g_compact_cs: compute
+// pipelines queued for capture again (cps_harvest) and not captured yet: the compaction closes after them
+static _Atomic int g_compact_periods, g_compact_closed, g_compact_bad, g_compact_cs;
 // Keep the crash-recovery guard if a compaction still fails in Metal. Markers name the OS build and capture method: a marker from the old archive-import path must not
 // disable the safer original-function capture. A failed flush of this method disables compaction on this OS build until it changes; ordinary archive reads remain available.
 static NSString *arch_compact_marker(void) { return [g_arch_dir stringByAppendingPathComponent:@"compacting"]; }
@@ -7987,11 +7988,13 @@ static dispatch_queue_t cps_harvest_q(void) {   // one capture at a time, at uti
 static void cps_harvest(MTL4ComputePipelineDescriptor *d, int compact) {
     if (!d) return;
     if (!arch_capturing()) { if (compact) g_compact_bad = 1; return; }
+    if (compact) g_compact_cs++;
     dispatch_async(cps_harvest_q(), ^{ @autoreleasepool {
         NSError *ce = nil; int cap = 0;
         id<MTLComputePipelineState> ps = arch_capture_cs(d, &ce, &cap);
         if (cap) { if (compact) g_compacted++; arch_note_new(); }
         else if (compact) g_compact_bad = 1;
+        if (compact && atomic_fetch_sub(&g_compact_cs, 1) == 1 && !atomic_load(&g_warm_running)) arch_flush_from(nil);   // the last one after the prewarm closes the compaction
         if (!ps) MLOG("[RED] compute pipeline %s: the Metal 4 compiler refused it (%s): not kept in the pipeline archive", d.computeFunctionDescriptor ? [(MTL4LibraryFunctionDescriptor *)d.computeFunctionDescriptor name].UTF8String : "(unnamed)",
                   ce ? ce.localizedDescription.UTF8String : "no error given");
     } });
@@ -8045,17 +8048,30 @@ static void arch_write_file(ArchEpoch *ep) {
 static void arch_flush_from(ArchEpoch *only) {
     if (!g_arch_cap || (!only && g_compact_enabled && atomic_load(&g_warm_running))) return;
     os_unfair_lock_lock(&g_ep_lock); int any = (!only || g_ep == only) && (atomic_load(&g_ep->n) || atomic_load(&g_ep->active)); os_unfair_lock_unlock(&g_ep_lock);
-    if (!any) return;   // nothing captured or under way: the period goes on
+    if (!any) {   // nothing captured or under way: the period goes on. A compaction whose last capture filled a period that is handed over already closes here
+        if (!only && g_compact_enabled && !atomic_load(&g_warm_running) && !atomic_load(&g_compact_closed)) {
+            // the queued compute captures first: one counted down has entered the period already, so an empty period then holds none of them
+            int queued = atomic_load(&g_compact_cs);
+            os_unfair_lock_lock(&g_ep_lock); int empty = !atomic_load(&g_ep->n) && !atomic_load(&g_ep->active); os_unfair_lock_unlock(&g_ep_lock);
+            if (!queued && empty && !atomic_exchange(&g_compact_closed, 1) && !atomic_load(&g_compact_periods)) {
+                dispatch_group_enter(g_arch_pending);
+                dispatch_async(g_arch_q, ^{ arch_compact_finish(); dispatch_group_leave(g_arch_pending); });
+            }
+        }
+        return;
+    }
     ArchEpoch *ne = ep_new();
     if (!ne) { MLOG("[RED] pipeline archive: Metal made no compiler for a new flush period: the captures go on into the current one"); return; }
     os_unfair_lock_lock(&g_ep_lock);
+    int queued = atomic_load(&g_compact_cs);   // before the period's count: a compute capture counted down is in it, not in the next one
     ArchEpoch *old = g_ep; any = (!only || old == only) && (atomic_load(&old->n) || atomic_load(&old->active));   // again: another flush may just have handed it over
     if (any) {
         g_ep = ne;
-        // Every period from the first recaptured base on may hold some (see arch_compact_allowed); the first one handed over after the prewarm is the compaction's last
-        if (g_compact_enabled && atomic_load(&g_compacted) && !atomic_load(&g_compact_closed)) {
+        // Every period handed over while the compaction is open may hold recaptured bases (see arch_compact_allowed), the one a recapture fills too, which is handed over before
+        // that recapture is counted; the first one handed over after the prewarm and its queued compute captures is the compaction's last
+        if (g_compact_enabled && !atomic_load(&g_compact_closed)) {
             old->compacting = 1; atomic_fetch_add(&g_compact_periods, 1);
-            if (!atomic_load(&g_warm_running)) atomic_store(&g_compact_closed, 1);
+            if (!atomic_load(&g_warm_running) && !queued) atomic_store(&g_compact_closed, 1);
         }
     }
     os_unfair_lock_unlock(&g_ep_lock);

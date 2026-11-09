@@ -1,6 +1,6 @@
 // Metal 4 pipelines (pso_build): one base per pipeline with its colour state unspecialized, made into pipelines by specialization, kept in the pipeline archive.
 // Checks: pipelines that differ only in colour state share one base; a specialized pipeline draws the same pixels as one built through the MTLDevice; a flushed archive
-// file serves the base again without compiling; a flush of bases without a vertex layout is a p<seq> file, where a base with a layout is not looked up; a function with no
+// file serves the base again without compiling; a flush of bases without a vertex layout is a p<seq> file, where a base with a layout is not looked up; a compaction closes when its last capture filled a period, and after the compute pipelines queued for it, and a failed write of the period a recapture fills keeps the old files; a compaction closed while its last period has a compile under way keeps the old files until that period is written; a function with no
 // Metal 4 descriptor keeps the MTLDevice path; pso_key_norm drops what no pipeline depends on; compaction merges the files the prewarm took bases from into one per full period despite a
 // mid-prewarm timer flush, removing them only after its last period, and a compaction that did not finish is not tried again on the same system build; depth-only draws write depth; concurrent colour variants compile
 // one base; archive flushes preserve unrelated compiler state; a function with function constants is specialized by its pipeline's descriptor, not through its library,
@@ -150,7 +150,28 @@ static void compute_pipelines(void) {
     dispatch_sync(cps_harvest_q(), ^{});
     EXPECT("compute, compaction: captured again", 1, g_compacted);
     EXPECT("compute, compaction: waits for the flush", pending + 1, g_arch_new);
-    atomic_store(&g_warm_running, 0); g_compact_enabled = 0; g_compacted = 0;
+    // still queued for capture when the prewarm ends: the compaction closes once it is captured, not at the flush after the prewarm
+    NSString *kold = names.count ? [@(kdir) stringByAppendingPathComponent:names[0]] : @"";
+    g_compact_files = @[kold]; g_compacted = 1; g_compact_closed = 0; g_compact_periods = 0; g_compact_bad = 0;   // the file it is in is the old one; 1: a base captured again before
+    dispatch_semaphore_t hold = dispatch_semaphore_create(0);
+    dispatch_async(cps_harvest_q(), ^{ dispatch_semaphore_wait(hold, DISPATCH_TIME_FOREVER); });
+    EXPECT("compute, queued at the prewarm's end: a pipeline", 1, cps_new(kf, &err) != nil);
+    atomic_store(&g_warm_running, 0); arch_flush();
+    EXPECT("compute, queued at the prewarm's end: the compaction stays open", 0, g_compact_closed);
+    dispatch_semaphore_signal(hold); dispatch_sync(cps_harvest_q(), ^{}); arch_flush_wait();
+    EXPECT("compute, queued at the prewarm's end: its capture written before the close", 0, g_arch_new);
+    EXPECT("compute, queued at the prewarm's end: closed once it is captured", 1, g_compact_closed && g_compacted == 2 && !g_compact_cs);
+    EXPECT("compute, queued at the prewarm's end: the old file removed after", 0, [NSFileManager.defaultManager fileExistsAtPath:kold]);
+    {   // as the next start: the files left serve it, nothing built
+        NSMutableArray<id<MTL4Archive>> *left = [NSMutableArray array];
+        for (NSString *n in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(kdir) error:nil]) if ([n hasSuffix:@".mtl4a"])
+            [left addObject:[g_dev newArchiveWithURL:[NSURL fileURLWithPath:[@(kdir) stringByAppendingPathComponent:n]] error:&err]];
+        NSArray *was = g_arch4; g_arch4 = left; uint64_t run0 = g_cps_run, built0 = g_cps_built; atomic_store(&g_warm_running, 0);
+        EXPECT("compute, queued at the prewarm's end: the next start takes it from the new files", 1, cps_new(kf, &err) != nil && g_cps_run == run0 + 1 && g_cps_built == built0);
+        g_arch4 = was;
+    }
+    g_compact_files = nil;
+    atomic_store(&g_warm_running, 0); g_compact_enabled = 0; g_compacted = 0; g_compact_closed = 0; g_compact_periods = 0;
     arch_flush_wait();
     // no Metal 4 descriptor: built through the MTLDevice, no lookup, nothing captured
     int looked = la->lookups; built = g_cps_built; pending = g_arch_new;
@@ -171,6 +192,12 @@ static void compute_pipelines(void) {
     calls++; marked += [[NSString stringWithContentsOfFile:arch_compact_marker() encoding:NSUTF8StringEncoding error:nil] isEqualToString:arch_compact_stamp()];
     return [ser serializeAsArchiveAndFlushToURL:url error:error];
 }
+@end
+// A period whose write fails (a full disk, Metal's store): nothing is written
+@interface FailSerializer : NSObject { @public id<MTL4PipelineDataSetSerializer> ser; } @end
+@implementation FailSerializer
+- (id)forwardingTargetForSelector:(SEL)selector { return ser; }
+- (BOOL)serializeAsArchiveAndFlushToURL:(NSURL *)url error:(NSError **)error { if (error) *error = [NSError errorWithDomain:@"test" code:2 userInfo:nil]; return NO; }
 @end
 // Model another compiler creating state before the real compiler call returns.
 // The UUID fixture belongs exclusively to this test; no discovered folder is removed.
@@ -557,6 +584,96 @@ int main(int argc, char **argv) { @autoreleasepool {
     EXPECT("unregistered function: a pipeline", 1, l != nil);
     EXPECT("unregistered function: MTLDevice build", legacy + 1, g_pb_legacy);
     depth_only();
+    // a compaction whose last capture fills its period: that period is handed over in the prewarm, and the flush after it, with nothing to hand over, still closes the compaction
+    {
+        char cdir[] = "/tmp/t_pso_exact.XXXXXX"; if (!mkdtemp(cdir)) abort();
+        NSString *saved = g_arch_dir; g_arch_dir = @(cdir); nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = @[]; g_arch4p = @[];
+        g_compact_enabled = 0; g_compact_files = nil; g_compacted = 0; g_compact_periods = 0; g_compact_closed = 0; g_compact_bad = 0;
+        NSMutableArray<MTLRenderPipelineDescriptor *> *descs = [NSMutableArray array];
+        for (int i = 0; i <= PSO_ARCH_COMPACT; i++) {
+            MTLRenderPipelineDescriptor *cd = desc(MTLPixelFormatRGBA8Unorm, 0, MTLPixelFormatRGBA8Unorm, MTLColorWriteMaskAll, 1);
+            cd.vertexDescriptor.layouts[16].stride = 16 * (i + 40); [descs addObject:cd];
+            if (!pso_build(cd, &err)) { fprintf(stderr, "exact: no pipeline %d\n", i); failed++; }
+            arch_flush_wait();
+        }
+        NSArray<NSString *> *names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil] sortedArrayUsingSelector:@selector(compare:)];
+        NSMutableArray<id<MTL4Archive>> *open = [NSMutableArray array]; NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        for (NSString *n in names.reverseObjectEnumerator) { NSString *f = [@(cdir) stringByAppendingPathComponent:n]; [paths addObject:f]; [open addObject:[g_dev newArchiveWithURL:[NSURL fileURLWithPath:f] error:&err]]; }
+        nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = open; g_compact_enabled = 1; g_compact_files = paths;
+        g_arch_period_max = PSO_ARCH_COMPACT + 1;   // the nine bases captured again fill one period exactly
+        atomic_store(&g_warm_running, 1);
+        for (MTLRenderPipelineDescriptor *cd in descs) pso_build(cd, &err);
+        atomic_store(&g_warm_running, 0);
+        arch_flush_wait();   // the full period is written, and the flush after the prewarm finds nothing to hand over; the wait covers the finish it queues
+        EXPECT("exact period: the compaction closes and finishes", 1, g_compacted == (int)descs.count && !(g_compact_periods + !g_compact_closed + g_compact_bad));
+        int left = 0; for (NSString *f in paths) left += [NSFileManager.defaultManager fileExistsAtPath:f];
+        EXPECT("exact period: the old files removed", 0, left);
+        nvn_hm_clear(&g_pbase, hm_rel); g_compact_enabled = 0; g_compact_files = nil; g_compacted = 0; g_compact_closed = 0; g_arch_period_max = ARCH_PERIOD_MAX;
+        [NSFileManager.defaultManager removeItemAtPath:@(cdir) error:nil]; g_arch_dir = saved; g_arch4 = @[];
+    }
+    // a compaction whose last period still has a compile under way when the flush after the prewarm closes it: the old files stay until that period is written, then go
+    {
+        char cdir[] = "/tmp/t_pso_gate.XXXXXX"; if (!mkdtemp(cdir)) abort();
+        NSString *saved = g_arch_dir; g_arch_dir = @(cdir); nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = @[]; g_arch4p = @[];
+        g_compact_enabled = 0; g_compact_files = nil; g_compacted = 0; g_compact_periods = 0; g_compact_closed = 0; g_compact_bad = 0;
+        NSMutableArray<MTLRenderPipelineDescriptor *> *descs = [NSMutableArray array];
+        for (int i = 0; i <= PSO_ARCH_COMPACT; i++) {
+            MTLRenderPipelineDescriptor *cd = desc(MTLPixelFormatRGBA8Unorm, 0, MTLPixelFormatRGBA8Unorm, MTLColorWriteMaskAll, 1);
+            cd.vertexDescriptor.layouts[16].stride = 16 * (i + 110); [descs addObject:cd];
+            if (!pso_build(cd, &err)) { fprintf(stderr, "gate: no pipeline %d\n", i); failed++; }
+            arch_flush_wait();
+        }
+        NSArray<NSString *> *names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil] sortedArrayUsingSelector:@selector(compare:)];
+        NSMutableArray<id<MTL4Archive>> *open = [NSMutableArray array]; NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        for (NSString *n in names.reverseObjectEnumerator) { NSString *f = [@(cdir) stringByAppendingPathComponent:n]; [paths addObject:f]; [open addObject:[g_dev newArchiveWithURL:[NSURL fileURLWithPath:f] error:&err]]; }
+        nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = open; g_compact_enabled = 1; g_compact_files = paths;
+        g_arch_period_max = PSO_ARCH_COMPACT + 1;   // the nine captured again fill one period exactly: it is handed over in the prewarm
+        ArchEpoch *held = ep_enter();   // a compile under way in the period the nine fill: its write waits for it
+        atomic_store(&g_warm_running, 1);
+        for (MTLRenderPipelineDescriptor *cd in descs) pso_build(cd, &err);
+        atomic_store(&g_warm_running, 0); arch_flush();   // nothing to hand over: it closes the compaction while that period is not written
+        dispatch_sync(g_arch_q, ^{});   // whatever that flush queued has run (the held period's write is not queued yet)
+        int kept = 0; for (NSString *f in paths) kept += [NSFileManager.defaultManager fileExistsAtPath:f];
+        EXPECT("compile under way: closed, the old files kept until its period is written", 1, g_compact_closed && kept == (int)paths.count);
+        ep_leave(held); arch_flush_wait();
+        int left = 0; for (NSString *f in paths) left += [NSFileManager.defaultManager fileExistsAtPath:f];
+        EXPECT("compile under way: the old files removed once its period is written", 0, left);
+        nvn_hm_clear(&g_pbase, hm_rel); g_compact_enabled = 0; g_compact_files = nil; g_compacted = 0; g_compact_closed = 0; g_compact_periods = 0; g_arch_period_max = ARCH_PERIOD_MAX;
+        [NSFileManager.defaultManager removeItemAtPath:@(cdir) error:nil]; g_arch_dir = saved; g_arch4 = @[];
+    }
+    // the period a recapture fills is handed over before that recapture is counted: it is the compaction's too, and if its write fails the old files stay
+    {
+        char cdir[] = "/tmp/t_pso_fill.XXXXXX"; if (!mkdtemp(cdir)) abort();
+        NSString *saved = g_arch_dir; g_arch_dir = @(cdir); nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = @[]; g_arch4p = @[];
+        g_compact_enabled = 0; g_compact_files = nil; g_compacted = 0; g_compact_periods = 0; g_compact_closed = 0; g_compact_bad = 0;
+        NSMutableArray<MTLRenderPipelineDescriptor *> *small = [NSMutableArray array];
+        for (int i = 0; i <= PSO_ARCH_COMPACT; i++) {
+            MTLRenderPipelineDescriptor *cd = desc(MTLPixelFormatRGBA8Unorm, 0, MTLPixelFormatRGBA8Unorm, MTLColorWriteMaskAll, 1);
+            cd.vertexDescriptor.layouts[16].stride = 16 * (i + 80); [small addObject:cd];
+            if (!pso_build(cd, &err)) { fprintf(stderr, "fill: no pipeline %d\n", i); failed++; }
+            arch_flush_wait();
+        }
+        NSArray<NSString *> *names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil] sortedArrayUsingSelector:@selector(compare:)];
+        NSMutableArray<id<MTL4Archive>> *open = [NSMutableArray array]; NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        for (NSString *n in names.reverseObjectEnumerator) { NSString *f = [@(cdir) stringByAppendingPathComponent:n]; [paths addObject:f]; [open addObject:[g_dev newArchiveWithURL:[NSURL fileURLWithPath:f] error:&err]]; }
+        nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = open; g_compact_enabled = 1; g_compact_files = paths;
+        g_arch_period_max = 4; atomic_store(&g_warm_running, 1);
+        for (int i = 0; i < 3; i++) {   // three new bases first: the first recapture is the period's 4th capture
+            MTLRenderPipelineDescriptor *cd = desc(MTLPixelFormatRGBA8Unorm, 0, MTLPixelFormatRGBA8Unorm, MTLColorWriteMaskAll, 1);
+            cd.vertexDescriptor.layouts[16].stride = 16 * (i + 90); pso_build(cd, &err);
+        }
+        FailSerializer *fs = [FailSerializer new]; fs->ser = g_ep->ser; g_ep->ser = (id<MTL4PipelineDataSetSerializer>)fs;   // that period's write fails
+        for (MTLRenderPipelineDescriptor *cd in small) pso_build(cd, &err);
+        MTLRenderPipelineDescriptor *last = desc(MTLPixelFormatRGBA8Unorm, 0, MTLPixelFormatRGBA8Unorm, MTLColorWriteMaskAll, 1);
+        last.vertexDescriptor.layouts[16].stride = 16 * 99; pso_build(last, &err);   // one more new base: the last period is not empty, so it closes the compaction
+        atomic_store(&g_warm_running, 0); arch_flush_wait();
+        EXPECT("filled period: its failed write counts against the compaction", 1, g_compact_bad);
+        int left = 0; for (NSString *f in paths) left += [NSFileManager.defaultManager fileExistsAtPath:f];
+        EXPECT("filled period: the old files stay", (int)paths.count, left);
+        nvn_hm_clear(&g_pbase, hm_rel); g_compact_enabled = 0; g_compact_files = nil; g_compacted = 0; g_compact_closed = 0; g_compact_bad = 0; g_compact_periods = 0;
+        g_arch_period_max = ARCH_PERIOD_MAX;
+        [NSFileManager.defaultManager removeItemAtPath:@(cdir) error:nil]; g_arch_dir = saved; g_arch4 = @[];
+    }
     concurrent_bases(0);
     concurrent_bases(1);
     // key normalization
